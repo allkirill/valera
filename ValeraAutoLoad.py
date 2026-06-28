@@ -11,7 +11,7 @@ import warnings
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, urljoin
 from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
@@ -165,6 +165,7 @@ class AppSettings:
     report_copy: bool = False
     clean_raw: bool = False
     ssl_verify: bool = True
+    aggressive_parse: bool = True
     preset_name: str = "santehnica.ru"
     pdf_always_square: bool = True
     selected_rejected_files: List[str] = field(default_factory=list)
@@ -663,12 +664,148 @@ class CloudResolver:
             LOGGER.debug("Yandex resolve failed: %s", e)
         return [(public_key, None)]
 
+    def _get_mail_base_url(self, weblink: str) -> Optional[str]:
+        """Парсит base_url (weblink_get) из HTML страницы публичной папки.
+        Это единственный надёжный способ для публичных папок.
+        """
+        try:
+            public_url = f"https://cloud.mail.ru/public/{weblink.lstrip('/')}"
+            r = self.session.get(public_url, timeout=15, verify=self.verify)
+            if r.status_code != 200:
+                return None
+            
+            # Метод из gist: ищем weblink_get в HTML
+            for line in r.content.split(b'\n'):
+                parts = line.split(b'"weblink_get":[{"count":1,"url":"')
+                if len(parts) > 1:
+                    base_url = parts[1].split(b'"')[0].decode('utf-8', errors='ignore')
+                    return base_url.replace('\\/', '/')
+            
+            # Fallback: regex по всему HTML
+            m = re.search(r'"weblink_get"\s*:\s*\[\s*{\s*"count"\s*:\s*1\s*,\s*"url"\s*:\s*"([^"]+)"', r.text)
+            if m:
+                return m.group(1).replace('\\/', '/')
+                
+        except Exception as e:
+            LOGGER.debug("Mail base URL parse failed: %s", e)
+        return None
+
+    def _get_mail_token(self) -> Optional[str]:
+        """Получает download token. Парсим JSON вручную — просто и надёжно."""
+        try:
+            r = self.session.get(
+                "https://cloud.mail.ru/api/v2/tokens/download",
+                timeout=10, verify=self.verify
+            )
+            if r.status_code == 200:
+                # Парсим как в gist: split по кавычкам, берём 5-й элемент
+                text = r.text
+                parts = text.split('"')
+                if len(parts) > 5:
+                    return parts[5]
+                # Fallback: JSON parse
+                data = r.json()
+                if data.get("status") == 200:
+                    return data.get("body", {}).get("token") or data.get("token")
+        except Exception as e:
+            LOGGER.debug("Mail token failed: %s", e)
+        return None
+
+    def _list_mail_folder(self, weblink: str) -> List[Tuple[str, Optional[str]]]:
+        """Достаёт ВСЕ файлы из публичной папки cloud.mail.ru.
+        Алгоритм из gist: base_url из HTML → token → листинг с пагинацией.
+        """
+        results = []
+        try:
+            # 1. Базовый URL из HTML (обязательно!)
+            base_url = self._get_mail_base_url(weblink)
+            if not base_url:
+                LOGGER.warning("Mail folder: cannot get base_url for %s", weblink)
+                return []
+
+            # 2. Токен
+            token = self._get_mail_token()
+            if not token:
+                LOGGER.warning("Mail folder: cannot get download token")
+                return []
+
+            # 3. Чистим weblink для API
+            clean = weblink.lstrip('/')
+            if clean.startswith('public/'):
+                clean = clean[len('public/'):]
+            
+            # 4. Листим с пагинацией
+            offset = 0
+            limit = 500
+            
+            while True:
+                list_url = (
+                    f"https://cloud.mail.ru/api/v2/folder"
+                    f"?weblink={quote(clean, safe='~@#$()*!=:;,.?/\\')}"
+                    f"&offset={offset}&limit={limit}&api=2"
+                )
+                
+                r = self.session.get(list_url, timeout=20, verify=self.verify)
+                if r.status_code != 200:
+                    LOGGER.debug("Mail folder list HTTP %s", r.status_code)
+                    break
+                
+                try:
+                    data = r.json()
+                except Exception:
+                    break
+                
+                if data.get("status") != 200:
+                    LOGGER.debug("Mail folder list status %s", data.get("status"))
+                    break
+                
+                body = data.get("body", {})
+                items = body.get("list", [])
+                if not items:
+                    break
+                
+                for item in items:
+                    item_type = item.get("type") or item.get("kind", "")
+                    name = item.get("name", "")
+                    item_weblink = item.get("weblink", "")
+                    
+                    if item_type in ("folder", "dir"):
+                        # Рекурсия в подпапки
+                        sub_results = self._list_mail_folder(item_weblink)
+                        results.extend(sub_results)
+                    else:
+                        # Формируем прямую ссылку на скачивание
+                        # weblink файла = его путь относительно корня папки
+                        file_path = item_weblink
+                        if name and not file_path.endswith('/' + name):
+                            file_path = file_path + '/' + name
+                        
+                        dl_url = f"{base_url}/{quote(file_path, safe='~@#$()*!=:;,.?/\\')}?key={token}"
+                        results.append((dl_url, None))
+                
+                # Проверяем, есть ли ещё
+                total = body.get("count", {})
+                total_items = total.get("folders", 0) + total.get("files", 0)
+                if offset + len(items) >= total_items:
+                    break
+                offset += limit
+                if offset > 20000:  # защита
+                    break
+            
+            LOGGER.info("Mail folder %s: found %d files", weblink, len(results))
+            return results
+            
+        except Exception as e:
+            LOGGER.warning("Mail folder list error: %s", e)
+        return results
+
+ 
     def resolve_mail(self, public_key: str):
         parsed = urlparse(public_key)
         path = parsed.path
         weblink = path[len("/public"):] if path.startswith("/public/") else path
 
-        # 1. Пробуем API file
+        # 1. Пробуем API file — самый надёжный способ для одиночного файла
         try:
             r = self.session.get(
                 f"https://cloud.mail.ru/api/v2/file?weblink={quote(weblink, safe='')}",
@@ -678,6 +815,15 @@ class CloudResolver:
                 data = r.json()
                 if data.get("status") == 200:
                     body = data.get("body", {})
+                    # Если это папка (kind == "folder") — достаём содержимое
+                    if body.get("kind") == "folder" or body.get("type") == "folder":
+                        files = self._list_mail_folder(weblink)
+                        if files:
+                            return files
+                        # Fallback на HTML-парсинг
+                        files = self._extract_mail_folder_from_html(r.text, public_key)
+                        if files:
+                            return files
                     if body.get("download_url"):
                         return [(body["download_url"], None)]
                     wg = body.get("weblink_get", [])
@@ -686,7 +832,7 @@ class CloudResolver:
         except Exception as e:
             LOGGER.debug("Mail file API failed: %s", e)
 
-        # 2. Discovery
+        # 2. Discovery API
         try:
             r = self.session.get(
                 f"https://cloud.mail.ru/api/v2/discovery?weblink={quote(weblink, safe='')}",
@@ -695,17 +841,38 @@ class CloudResolver:
             if r.status_code == 200:
                 data = r.json()
                 if data.get("status") == 200:
-                    wg = data.get("body", {}).get("weblink_get", [])
+                    body = data.get("body", {})
+                    wg = body.get("weblink_get", [])
                     if wg and wg[0].get("url"):
+                        # Если это папка — достаём содержимое
+                        if body.get("kind") == "folder" or body.get("type") == "folder":
+                            files = self._list_mail_folder(weblink)
+                            if files:
+                                return files
+                            # Fallback на HTML-парсинг
+                            files = self._extract_mail_folder_from_html(r.text, public_key)
+                            if files:
+                                return files
+                        # Одиночный файл
                         return [(wg[0]["url"], None)]
         except Exception as e:
             LOGGER.debug("Mail discovery failed: %s", e)
 
-        # 3. Парсим HTML
+        # 3. Парсим HTML — ищем прямую ссылку или список файлов в папке
         try:
             r = self.session.get(public_key, timeout=10, verify=self.verify)
             if r.status_code == 200:
                 html = r.text
+                # Сначала пробуем найти список файлов в папке через JSON в HTML
+                files = self._extract_mail_folder_from_html(html, public_key)
+                if files:
+                    return files
+
+                # Пробуем gist-метод: base_url из HTML + токен + API листинг
+                folder_files = self._list_mail_folder(weblink)
+                if folder_files:
+                    return folder_files
+
                 m = re.search(r'data-url="([^"]+)"', html)
                 if m:
                     return [(m.group(1), None)]
@@ -718,6 +885,10 @@ class CloudResolver:
                 m = re.search(r'"fileUrl":"([^"]+)"', html)
                 if m:
                     return [(m.group(1).replace('\\/', '/'), None)]
+                # og:image / twitter:image
+                m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+                if m:
+                    return [(m.group(1), None)]
         except Exception as e:
             LOGGER.debug("Mail HTML parse failed: %s", e)
 
@@ -749,6 +920,526 @@ class CloudResolver:
 
         return [(dl_url, None)]
 
+        # 3. Парсим HTML — ищем прямую ссылку или список файлов в папке
+        try:
+            r = self.session.get(public_key, timeout=10, verify=self.verify)
+            if r.status_code == 200:
+                html = r.text
+                # Сначала пробуем найти список файлов в папке через JSON в HTML
+                files = self._extract_mail_folder_from_html(html, public_key)
+                if files:
+                    return files
+                
+                # Пробуем gist-метод: base_url из HTML + токен + API листинг
+                folder_files = self._list_mail_folder(weblink)
+                if folder_files:
+                    return folder_files
+
+                m = re.search(r'data-url="([^"]+)"', html)
+                if m:
+                    return [(m.group(1), None)]
+                m = re.search(r'"downloadUrl":"([^"]+)"', html)
+                if m:
+                    return [(m.group(1).replace('\\/', '/'), None)]
+                m = re.search(r'"weblink_get":\s*\[\s*{\s*"url":\s*"([^"]+)"', html)
+                if m:
+                    return [(m.group(1).replace('\\/', '/'), None)]
+                m = re.search(r'"fileUrl":"([^"]+)"', html)
+                if m:
+                    return [(m.group(1).replace('\\/', '/'), None)]
+                # og:image / twitter:image
+                m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+                if m:
+                    return [(m.group(1), None)]
+        except Exception as e:
+            LOGGER.debug("Mail HTML parse failed: %s", e)
+
+        # 4. ?download=1
+        dl_url = public_key
+        if "?" not in dl_url:
+            dl_url += "?download=1"
+        else:
+            dl_url += "&download=1"
+        try:
+            r = self.session.head(dl_url, timeout=5, verify=self.verify, allow_redirects=True)
+            if r.status_code == 200:
+                ct = r.headers.get("Content-Type", "").lower()
+                if "html" not in ct:
+                    return [(dl_url, None)]
+        except Exception:
+            pass
+
+        # 5. cloclo fallback
+        cloclo_url = f"https://cloclo3.cloud.mail.ru/weblink/view{weblink}"
+        try:
+            r = self.session.head(cloclo_url, timeout=5, verify=self.verify, allow_redirects=True)
+            if r.status_code == 200:
+                ct = r.headers.get("Content-Type", "").lower()
+                if "image" in ct or "pdf" in ct or "octet-stream" in ct:
+                    return [(cloclo_url, None)]
+        except Exception:
+            pass
+
+        return [(dl_url, None)]
+
+    def _extract_mail_folder_from_html(self, html: str, base_url: str) -> List[Tuple[str, Optional[str]]]:
+        """Парсит HTML-страницу папки mail.ru — ищет ссылки на отдельные файлы."""
+        results = []
+        # Ищем все ссылки на /public/ в href — это могут быть файлы/подпапки
+        for m in re.finditer(r'href="(https?://cloud\.mail\.ru/public/[A-Za-z0-9/_\-]+)"', html):
+            sub_url = m.group(1)
+            # Извлекаем имя файла (последний компонент пути)
+            parts = sub_url.rstrip('/').split('/')
+            name = parts[-1] if parts else None
+            if name and name not in ['public']:
+                results.append((sub_url, name))
+        if results:
+            return results
+        # Альтернатива: JSON ссылки внутри HTML
+        for m in re.finditer(r'"(?:weblink|file|url|src|downloadUrl)"\s*:\s*"([^"]+/public/[A-Za-z0-9/_\-]+)"', html, re.I):
+            u = m.group(1).replace('\\/', '/')
+            name = u.rstrip('/').split('/')[-1]
+            results.append((u, name))
+        return results
+
+    # ============================================================
+    # GOOGLE DRIVE
+    # ============================================================
+    @staticmethod
+    def parse_google_id(url: str) -> Optional[str]:
+        """Извлекает file/folder ID из любой формы ссылки Google Drive."""
+        if not url:
+            return None
+        # open?id=ID / uc?id=ID / uc?export=download&id=ID / thumbnail?id=ID
+        m = re.search(r'[?&]id=([a-zA-Z0-9_\-]+)', url)
+        if m:
+            return m.group(1)
+        # /file/d/ID/ или /folders/ID или /drive/folders/ID
+        m = re.search(r'/(?:file/d/|folders/|drive/folders/|drive/u/\d+/folders/)([a-zA-Z0-9_\-]+)', url)
+        if m:
+            return m.group(1)
+        return None
+
+    @staticmethod
+    def is_google_drive_folder(url: str) -> bool:
+        if not url:
+            return False
+        u = url.lower()
+        return ('/folders/' in u or '/folderview' in u or 'type=folder' in u) and 'drive.google.com' in u
+
+    def resolve_google_drive(self, url: str):
+        """Возвращает список (download_url, subfolder) для Google Drive.
+        Если ссылка на папку — пытается достать список файлов внутри неё.
+        """
+        file_id = self.parse_google_id(url)
+        if not file_id:
+            return [(url, None)]
+
+        # Если это папка — пытаемся собрать все файлы из неё
+        if self.is_google_drive_folder(url):
+            files = self._list_google_drive_folder(file_id)
+            if files:
+                return files
+            # Если папку открыть не удалось — возвращаем как есть
+            return [(url, None)]
+
+        # Для одиночного файла пробуем несколько стратегий
+        candidates = [
+            f"https://drive.google.com/uc?export=download&id={file_id}",
+            f"https://drive.google.com/uc?export=view&id={file_id}",
+            f"https://drive.google.com/thumbnail?id={file_id}&sz=w2000",
+            f"https://lh3.googleusercontent.com/d/{file_id}=s0",
+            f"https://lh3.googleusercontent.com/d/{file_id}=w2000",
+        ]
+        results = []
+        for cu in candidates:
+            try:
+                r = self.session.get(
+                    cu, timeout=15, verify=self.verify, allow_redirects=True,
+                    headers={"Referer": "https://drive.google.com/"}
+                )
+                if r.status_code != 200:
+                    continue
+                ct = r.headers.get("Content-Type", "").lower()
+                if "text/html" in ct:
+                    # Для больших файлов Google показывает страницу-предупреждение
+                    # с confirm-токеном — пробуем его извлечь
+                    html = r.text
+                    m = re.search(r'href="(/uc\?export=download[^"]+)"', html)
+                    if m:
+                        confirm_url = "https://drive.google.com" + m.group(1).replace("&amp;", "&")
+                        results.append((confirm_url, None))
+                        continue
+                    m = re.search(r'"downloadUrl"\s*:\s*"([^"]+)"', html)
+                    if m:
+                        results.append((m.group(1).replace("\\u003d", "=").replace("\\/", "/"), None))
+                        continue
+                    # og:image / og:video — fallback
+                    m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+                    if m:
+                        results.append((m.group(1), None))
+                        continue
+                    continue
+                # Бинарь получен — URL рабочий, держим первым
+                # (мы не качаем сюда, только кладём URL в очередь)
+                results.insert(0, (cu, None))
+                # Если удалось с первого URL получить бинарь — остальные не нужны
+                return results[:3]
+            except Exception as e:
+                LOGGER.debug("GDrive %s failed: %s", cu, e)
+                continue
+
+        return results if results else [(url, None)]
+
+    def _list_google_drive_folder(self, folder_id: str):
+        """Пытается вытащить список файлов из публичной папки Google Drive.
+        Возвращает список [(url, subfolder), ...] либо [].
+        """
+        urls = []
+        try:
+            r = self.session.get(
+                f"https://drive.google.com/drive/folders/{folder_id}",
+                timeout=20, verify=self.verify, allow_redirects=True,
+                headers={"Referer": "https://drive.google.com/"}
+            )
+            if r.status_code != 200:
+                return []
+            html = r.text
+            # Паттерн 1: data-id="FILE_ID" с именем файла
+            # AF_initDataCallback — JSON внутри страницы
+            m = re.search(r'AF_initDataCallback\(\{key:\s*[\'"](\w+)[\'"].*?data:(.*?)\}\);', html, re.DOTALL)
+            if m:
+                # Грубый поиск всех ID файлов вида [null,null,"1AbCd..."]
+                ids = re.findall(r'"([a-zA-Z0-9_\-]{20,})"', m.group(2))
+                # Убираем дубликаты, оставляя те, что похожи на Drive ID (>=20 chars)
+                seen = set()
+                for fid in ids:
+                    if fid in seen or fid == folder_id:
+                        continue
+                    seen.add(fid)
+                    urls.append((
+                        f"https://drive.google.com/uc?export=download&id={fid}",
+                        None
+                    ))
+                    if len(urls) >= 50:
+                        break
+            if urls:
+                return urls
+
+            # Паттерн 2: og:url / прямые ссылки /file/d/
+            for m in re.finditer(r'href="(/file/d/([a-zA-Z0-9_\-]+)/view[^"]*)"', html):
+                fid = m.group(2)
+                urls.append((
+                    f"https://drive.google.com/uc?export=download&id={fid}",
+                    None
+                ))
+                if len(urls) >= 50:
+                    break
+            if urls:
+                return urls
+
+            # Паттерн 3: data-id атрибуты на ссылках
+            for m in re.finditer(r'data-id="([a-zA-Z0-9_\-]+)"', html):
+                fid = m.group(1)
+                if fid == folder_id:
+                    continue
+                urls.append((
+                    f"https://drive.google.com/uc?export=download&id={fid}",
+                    None
+                ))
+                if len(urls) >= 50:
+                    break
+        except Exception as e:
+            LOGGER.debug("GDrive folder list failed: %s", e)
+        return urls
+
+    # ============================================================
+    # DROPBOX
+    # ============================================================
+    @staticmethod
+    def is_dropbox(url: str) -> bool:
+        if not url:
+            return False
+        u = url.lower()
+        return ('dropbox.com' in u) or ('dl.dropboxusercontent.com' in u)
+
+    def resolve_dropbox(self, url: str):
+        """Dropbox: меняет dl=0 на dl=1, raw=1 для прямого скачивания."""
+        try:
+            # Ссылка уже прямая (dl.dropboxusercontent.com) — оставляем
+            if 'dl.dropboxusercontent.com' in url:
+                return [(url, None)]
+            # dl=0 -> dl=1, иначе добавляем ?dl=1
+            if 'dl=' in url:
+                new_url = re.sub(r'dl=\d', 'dl=1', url)
+            elif '?' in url:
+                new_url = url + '&dl=1'
+            else:
+                new_url = url + '?dl=1'
+            return [(new_url, None)]
+        except Exception:
+            return [(url, None)]
+
+    # ============================================================
+    # ONEDRIVE / SHAREPOINT
+    # ============================================================
+    @staticmethod
+    def is_onedrive(url: str) -> bool:
+        if not url:
+            return False
+        u = url.lower()
+        return any(d in u for d in [
+            'onedrive.live.com', '1drv.ms', 'sharepoint.com',
+            'office.com', 'skydrive.com', 'storage.live.com'
+        ])
+
+    def resolve_onedrive(self, url: str):
+        """OneDrive/SharePoint — пытаемся получить embed URL или прямую ссылку."""
+        try:
+            # 1drv.ms — короткая ссылка, пусть редиректит сама
+            if '1drv.ms' in url.lower():
+                # Сначала HEAD чтобы получить финальный URL
+                try:
+                    r = self.session.get(
+                        url, timeout=10, verify=self.verify, allow_redirects=True,
+                        headers={"User-Agent": "Mozilla/5.0"}
+                    )
+                    final = r.url
+                    return [(final, None)]
+                except Exception:
+                    return [(url, None)]
+            # onedrive.live.com — меняем ?view на ?download
+            if 'onedrive.live.com' in url.lower():
+                # Попробуем добавить/download=1 или embed
+                candidates = []
+                if '?' in url:
+                    base = url
+                    candidates.append(base + ('&' if '?' in base else '?') + 'download=1')
+                else:
+                    candidates.append(url + '?download=1')
+                return [(c, None) for c in candidates]
+            return [(url, None)]
+        except Exception:
+            return [(url, None)]
+
+    # ============================================================
+    # HTML PARSER — поиск прямой ссылки на файл в HTML-обёртке
+    # ============================================================
+    def find_file_in_html(self, html: str, base_url: str) -> List[Tuple[str, Optional[str]]]:
+        """Ищет прямую ссылку на файл (jpg/png/webp/pdf) внутри HTML-страницы.
+        Возвращает список (url, subfolder), отсортированный по приоритету.
+        """
+        if not html or len(html) < 100:
+            return []
+        results = []
+
+        def absolutize(u: str) -> str:
+            if not u:
+                return u
+            if u.startswith(('http://', 'https://')):
+                return u
+            if u.startswith('//'):
+                scheme = urlparse(base_url).scheme or 'https'
+                return f"{scheme}:{u}"
+            return urljoin(base_url, u)
+
+        def score(u: str, weight: int = 0) -> int:
+            """Чем выше — тем приоритетнее."""
+            ul = u.lower()
+            s = weight
+            # Расширения файлов — самый сильный сигнал
+            for ext, w in [('.jpg', 200), ('.jpeg', 200), ('.png', 200),
+                          ('.webp', 200), ('.pdf', 180), ('.gif', 150), ('.bmp', 150)]:
+                if ext in ul:
+                    s += w
+                    break
+            # Google Drive / известные CDN
+            if 'googleusercontent.com' in ul or 'drive.google.com' in ul:
+                s += 80
+            if 'yadi.sk' in ul or 'disk.yandex' in ul:
+                s += 80
+            if 'mail.ru' in ul:
+                s += 80
+            # og:image / twitter:image уже учтены в weight
+            return s
+
+        # 1. <meta http-equiv="refresh"> — redirect на другую страницу
+        m = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\']\s*\d+\s*;\s*url=([^"\']+)["\']',
+                      html, re.I)
+        if m:
+            ru = absolutize(m.group(1).replace('&amp;', '&'))
+            results.append((ru, 1000))  # самый высокий приоритет — редирект
+
+        # 2. og:image / og:image:secure_url / twitter:image
+        for pat, w in [
+            (r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']', 950),
+            (r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', 940),
+            (r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', 935),
+            (r'<link[^>]+rel=["\']image_src["\'][^>]+href=["\']([^"\']+)["\']', 930),
+        ]:
+            for mm in re.finditer(pat, html, re.I):
+                results.append((absolutize(mm.group(1)), w))
+
+        # 3. Прямые ссылки на файлы в href/src
+        for mm in re.finditer(r'(?:href|src)\s*=\s*["\']([^"\']+\.(?:jpg|jpeg|png|webp|pdf|gif|bmp)(?:\?[^"\']*)?)["\']',
+                              html, re.I):
+            u = absolutize(mm.group(1))
+            if 'sprite' in u.lower() or 'icon' in u.lower() or 'logo' in u.lower():
+                continue
+            results.append((u, score(u, 700)))
+
+        # 4. JSON-LD или встроенный JSON с ссылкой
+        for mm in re.finditer(r'"(?:image|contentUrl|downloadUrl|fileUrl|src)"\s*:\s*"([^"]+)"', html, re.I):
+            u = absolutize(mm.group(1).replace('\\/', '/').replace('\\u0026', '&'))
+            if any(ext in u.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp', '.pdf']):
+                results.append((u, score(u, 600)))
+
+        # 5. Кнопка "Скачать" / data-атрибуты
+        for mm in re.finditer(r'data-(?:url|src|file|download|url)\s*=\s*"([^"]+)"', html, re.I):
+            u = absolutize(mm.group(1))
+            results.append((u, score(u, 500)))
+
+        # 6. Большие <img> (по атрибутам width/height или src без мелких значков)
+        for mm in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', html, re.I):
+            u = absolutize(mm.group(1))
+            if 'sprite' in u.lower() or 'icon' in u.lower() or 'avatar' in u.lower():
+                continue
+            results.append((u, score(u, 300)))
+
+        # 7. data-src (lazy load)
+        for mm in re.finditer(r'data-src=["\']([^"\']+)["\']', html, re.I):
+            u = absolutize(mm.group(1))
+            if 'sprite' in u.lower() or 'icon' in u.lower():
+                continue
+            results.append((u, score(u, 290)))
+
+        # Сортируем по score и убираем дубликаты
+        seen = set()
+        unique = []
+        for url, sc in sorted(results, key=lambda x: -x[1]):
+            if url in seen:
+                continue
+            seen.add(url)
+            unique.append(url)
+        return [(u, None) for u in unique]
+
+    # ============================================================
+    # ROUTER — главная точка входа для распознавания URL
+    # ============================================================
+    def resolve(self, url: str, aggressive: bool = True):
+        """Универсальный resolver: возвращает [(url, subfolder), ...]
+        для любого поддерживаемого облака. Если ничего не подошло — [(url, None)].
+
+        aggressive=False — для прямых ссылок: папки не раскрываются, HTML-парсинг не делается.
+        """
+        try:
+            ul = url.lower()
+            if 'drive.google.com' in ul:
+                if aggressive:
+                    return self.resolve_google_drive(url)
+                else:
+                    # Только прямая ссылка на файл, без попыток открыть папку
+                    fid = self.parse_google_id(url)
+                    if fid and not self.is_google_drive_folder(url):
+                        return [(f"https://drive.google.com/uc?export=download&id={fid}", None)]
+                    return [(url, None)]
+            if self.is_dropbox(url):
+                return self.resolve_dropbox(url)
+            if self.is_onedrive(url):
+                return self.resolve_onedrive(url)
+            if 'yadi.sk' in ul or 'disk.yandex' in ul or '360.yandex' in ul:
+                return self.resolve_yandex(url)
+            if 'cloud.mail.ru' in ul:
+                if aggressive:
+                    return self.resolve_mail(url)
+                else:
+                    # Только ?download=1 — без попыток открыть папку
+                    if '?' in url:
+                        return [(url + '&download=1', None)]
+                    return [(url + '?download=1', None)]
+        except Exception as e:
+            LOGGER.debug("resolve(%s) failed: %s", url, e)
+        return [(url, None)]
+
+
+# ============================================================
+# CRASH REPORTER — пишет детальный отчёт в текстовый файл
+# ============================================================
+def write_crash_report(exc_info=None, context: str = ""):
+    """Записывает подробный crash-отчёт в текстовый файл рядом со скриптом.
+    Используется при любом необработанном исключении или ручном вызове.
+    """
+    try:
+        # Куда писать: рядом со скриптом, или в домашнюю папку если она недоступна
+        try:
+            base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+            test_path = os.path.join(base_dir, "_test_write.tmp")
+            with open(test_path, "w") as f:
+                f.write("test")
+            os.remove(test_path)
+            report_dir = base_dir
+        except Exception:
+            report_dir = os.path.expanduser("~")
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        report_path = os.path.join(report_dir, f"valera_crash_{ts}.txt")
+
+        lines = []
+        lines.append("=" * 70)
+        lines.append("VALERA CRASH REPORT")
+        lines.append("=" * 70)
+        lines.append(f"Время:           {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"Контекст:        {context or '(не указан)'}")
+        lines.append(f"Python:          {sys.version}")
+        lines.append(f"Платформа:       {sys.platform}")
+        try:
+            import platform
+            lines.append(f"ОС:              {platform.platform()}")
+            lines.append(f"Архитектура:     {platform.machine()}")
+        except Exception:
+            pass
+        try:
+            from PySide6 import __version__ as qt_ver
+            lines.append(f"PySide6:         {qt_ver}")
+        except Exception:
+            pass
+
+        lines.append("")
+        lines.append("-" * 70)
+        lines.append("ТЕКУЩАЯ РАБОТА")
+        lines.append("-" * 70)
+        try:
+            cwd = os.getcwd()
+            lines.append(f"cwd:             {cwd}")
+        except Exception:
+            pass
+
+        lines.append("")
+        lines.append("-" * 70)
+        lines.append("TRACEBACK")
+        lines.append("-" * 70)
+        if exc_info is not None:
+            t, v, tb = exc_info
+            lines.append("".join(traceback.format_exception(t, v, tb)))
+        else:
+            # Если exc_info не передан — возьмём текущий
+            lines.append(traceback.format_exc())
+
+        lines.append("")
+        lines.append("-" * 70)
+        lines.append("ЗАВЕРШЕНО")
+        lines.append("-" * 70)
+
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        LOGGER.critical("Crash report written to: %s", report_path)
+        return report_path
+    except Exception as e:
+        # Если даже crash report не удалось записать — просто лог
+        LOGGER.critical("Failed to write crash report: %s", e)
+        return None
+
 
 # ============================================================
 # WORKER
@@ -773,6 +1464,14 @@ class Worker(QThread):
         self.resolver = CloudResolver(verify_ssl=settings.ssl_verify)
         self.download_errors = []
         self.start_time = 0
+        self.executor = None  # ThreadPoolExecutor — хранится здесь, чтобы можно было корректно отменить
+        self.session_closed = False
+        # Диагностика submit-фазы: кол-во поставленных в очередь и завершённых futures
+        self._dl_submitted = 0
+        self._dl_done = 0
+        self._dl_total = 0  # плановое количество futures (обновляется по ходу)
+        self._last_progress = -1  # последнее emit'нутое значение прогресса
+        self._last_log_time = 0   # для throttle логов в submit-фазе
 
     def pause(self):
         self._p = True
@@ -782,8 +1481,26 @@ class Worker(QThread):
         self._w.wakeAll()
 
     def cancel(self):
+        """Корректная отмена: прерывает загрузки и завершает воркер без висящих процессов."""
         self._c = True
         self.resume()
+
+        # 1. Закрываем HTTP session — это прервёт все текущие .get() с исключением
+        try:
+            if not self.session_closed:
+                self.resolver.session.close()
+                self.session_closed = True
+        except Exception as e:
+            LOGGER.debug("Session close on cancel failed: %s", e)
+
+        # 2. Отменяем ThreadPoolExecutor
+        # cancel_futures=True отменяет ещё не запущенные futures
+        # wait=False — не ждём завершения запущенных (они прервутся через закрытую session)
+        if self.executor is not None:
+            try:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+            except Exception as e:
+                LOGGER.debug("Executor shutdown failed: %s", e)
 
     def check_cancel(self) -> bool:
         return self._c
@@ -878,7 +1595,23 @@ class Worker(QThread):
             self.finished.emit(self.stats)
         except Exception:
             LOGGER.exception("Worker crash")
+            # Пишем crash-отчёт в файл рядом со скриптом
+            ctx = f"source_type={self.s.source_type}, source={self.s.source}, out_dir={self.s.out_dir}"
+            write_crash_report(context=ctx)
             self.error.emit(traceback.format_exc())
+        finally:
+            # Всегда закрываем session и executor — даже если было исключение или отмена
+            try:
+                if self.executor is not None and not self._c:
+                    self.executor.shutdown(wait=True)
+            except Exception:
+                pass
+            try:
+                if not self.session_closed:
+                    self.resolver.session.close()
+                    self.session_closed = True
+            except Exception:
+                pass
 
     def process_rejected(self):
         files = self.s.selected_rejected_files
@@ -1014,6 +1747,8 @@ class Worker(QThread):
             raise Exception("В Excel нет ссылок!")
         cm = {}
         proc = 0
+        # Прогресс для скачивания: 0-70% (а не 50%, чтобы обработка имела свой запас)
+        DL_PROGRESS_MAX = 70
 
         def download_task(fetch_url: str, raw_folder: str, idx: int):
             os.makedirs(raw_folder, exist_ok=True)
@@ -1029,18 +1764,78 @@ class Worker(QThread):
                 ctype = resp.headers.get("Content-Type", "").lower()
                 cd = resp.headers.get("Content-Disposition", "").lower()
 
+                # Если получили HTML — пытаемся найти прямую ссылку на файл
                 if "text/html" in ctype and len(content) > 1024:
-                    html = content[:4096].decode('utf-8', errors='ignore')
-                    m = re.search(r'content="\d+;url=([^"]+)"', html, re.IGNORECASE)
+                    html = content[:65536].decode('utf-8', errors='ignore')
+
+                    # 1. <meta http-equiv="refresh"> — короткий редирект
+                    m = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\']\s*\d+\s*;\s*url=([^"\']+)["\']',
+                                  html, re.I)
                     if m:
                         redirect_url = m.group(1).replace('&amp;', '&')
-                        resp2 = self.resolver.session.get(
-                            redirect_url, timeout=60, verify=self.s.ssl_verify, allow_redirects=True
-                        )
-                        if resp2.status_code == 200:
-                            content = resp2.content
-                            ctype = resp2.headers.get("Content-Type", "").lower()
-                            cd = resp2.headers.get("Content-Disposition", "").lower()
+                        if not redirect_url.startswith(('http://', 'https://')):
+                            redirect_url = urljoin(fetch_url, redirect_url)
+                        try:
+                            resp2 = self.resolver.session.get(
+                                redirect_url, timeout=60,
+                                headers={"Referer": fetch_url},
+                                verify=self.s.ssl_verify, allow_redirects=True
+                            )
+                            if resp2.status_code == 200 and \
+                               "text/html" not in resp2.headers.get("Content-Type", "").lower():
+                                content = resp2.content
+                                ctype = resp2.headers.get("Content-Type", "").lower()
+                                cd = resp2.headers.get("Content-Disposition", "").lower()
+                        except Exception as e:
+                            LOGGER.debug("HTML meta-refresh follow failed: %s", e)
+
+                    # 2. Поиск прямой ссылки на файл внутри HTML-обёртки
+                    if "text/html" in ctype and self.s.aggressive_parse:
+                        candidates = self.resolver.find_file_in_html(html, fetch_url)
+                        for cand_url, _ in candidates[:5]:  # пробуем первые 5 вариантов
+                            try:
+                                resp3 = self.resolver.session.get(
+                                    cand_url, timeout=60,
+                                    headers={"Referer": fetch_url},
+                                    verify=self.s.ssl_verify, allow_redirects=True
+                                )
+                                if resp3.status_code != 200:
+                                    continue
+                                ct3 = resp3.headers.get("Content-Type", "").lower()
+                                if "text/html" in ct3:
+                                    continue
+                                # Нашли бинарь — используем его
+                                content = resp3.content
+                                ctype = ct3
+                                cd = resp3.headers.get("Content-Disposition", "").lower()
+                                fetch_url = cand_url  # для логов
+                                break
+                            except Exception as e:
+                                LOGGER.debug("HTML candidate %s failed: %s", cand_url, e)
+                                continue
+
+                    # Если так и остались HTML — последний шанс: снова meta-refresh
+                    if "text/html" in ctype:
+                        m = re.search(r'content=["\']\s*\d+\s*;\s*url=([^"\']+)["\']', html, re.I)
+                        if m and self.s.aggressive_parse:
+                            redirect_url = m.group(1).replace('&amp;', '&')
+                            if not redirect_url.startswith(('http://', 'https://')):
+                                redirect_url = urljoin(fetch_url, redirect_url)
+                            try:
+                                resp4 = self.resolver.session.get(
+                                    redirect_url, timeout=60,
+                                    headers={"Referer": fetch_url},
+                                    verify=self.s.ssl_verify, allow_redirects=True
+                                )
+                                if resp4.status_code == 200 and \
+                                   "text/html" not in resp4.headers.get("Content-Type", "").lower():
+                                    content = resp4.content
+                                    ctype = resp4.headers.get("Content-Type", "").lower()
+                                    cd = resp4.headers.get("Content-Disposition", "").lower()
+                                    fetch_url = redirect_url
+                            except Exception:
+                                pass
+
                     if "text/html" in ctype:
                         raise Exception("Получена HTML-страница вместо файла. Ссылка устарела или требует авторизации.")
 
@@ -1081,8 +1876,21 @@ class Worker(QThread):
             except Exception as e:
                 return ("ERR", None, str(e), 0)
 
-        with ThreadPoolExecutor(max_workers=Defaults.DOWNLOAD_WORKERS) as executor:
+        # Сохраняем executor в self, чтобы cancel() мог его правильно закрыть
+        self.executor = ThreadPoolExecutor(max_workers=Defaults.DOWNLOAD_WORKERS)
+        # Сбрасываем диагностику
+        self._dl_submitted = 0
+        self._dl_done = 0
+        self._dl_total = 0
+        self._last_progress = -1
+        self._last_log_time = 0
+        try:
             futures = {}
+
+            # Эмитим сразу что начали — чтобы UI отреагировал
+            self.progress.emit(1)
+            self.log("[ИНФО]", "Загрузка", f"Найдено {tu} ссылок, готовлю задачи…")
+
             for sheet in wb.worksheets:
                 ss = sanitize_filename(sheet.title)
                 for row in sheet.iter_rows(min_row=1, max_row=sheet.max_row, max_col=mc):
@@ -1102,28 +1910,47 @@ class Worker(QThread):
                         cell = row[col]
                         urls = extract_urls(cell.value)
                         for val in urls:
-                            iy = any(d in val for d in ["yadi.sk", "disk.yandex", "360.yandex"])
-                            im = "cloud.mail.ru" in val
-                            if iy:
-                                utf = self.resolver.resolve_yandex(val)
-                            elif im:
-                                utf = self.resolver.resolve_mail(val)
-                            else:
-                                utf = [(val, None)]
+                            # Универсальный резолвер: сам поймёт, какой это облако
+                            utf = self.resolver.resolve(val, aggressive=self.s.aggressive_parse)
                             for fu, sf in utf:
                                 rf = os.path.join(tb, fn)
                                 if sf:
                                     rf = os.path.join(rf, sf)
-                                future = executor.submit(download_task, fu, rf, idx)
+                                future = self.executor.submit(download_task, fu, rf, idx)
                                 futures[future] = (cell, val, fu, fn)
                                 idx += 1
+                                self._dl_submitted += 1
+                                self._dl_total = max(self._dl_total, self._dl_submitted + len(futures) - self._dl_submitted)
+
+                                # Лог submit-фазы каждые ~5 сек или каждые 20 submit'ов
+                                now = time.time()
+                                if (now - self._last_log_time) > 5.0 or self._dl_submitted % 25 == 1:
+                                    self.log("[ИНФО]", "Загрузка",
+                                             f"Подготовлено {self._dl_submitted} задач…")
+                                    self._last_log_time = now
+                                    QApplication.processEvents()
+
+                                # Progress submit-фазы: 1-5% (подготовка не считается скачиванием)
+                                submit_pct = min(5, max(1, int(self._dl_submitted * 5 / max(1, tu))))
+                                if submit_pct != self._last_progress:
+                                    self.progress.emit(submit_pct)
+                                    self._last_progress = submit_pct
+                                    QApplication.processEvents()
+
+            # Все submit'ы готовы — сообщим и продолжим
+            self.log("[ИНФО]", "Загрузка",
+                     f"Все {self._dl_submitted} задач в работе, ждём скачивания…")
+            QApplication.processEvents()
+
+            # Основной цикл обработки завершённых futures
             for future in as_completed(futures):
                 if self.check_cancel():
                     break
                 cell, val, fu, folder_name = futures[future]
                 try:
                     res_type, path, err, size = future.result()
-                    self.stats["bytes"] += size
+                    if size > 0:
+                        self.stats["bytes"] += size
                     if res_type == "OK_IMG":
                         cm[path] = cell
                         self.log("[OK]", fu, f"Скачано {size/(1024*1024):.1f} МБ")
@@ -1136,21 +1963,56 @@ class Worker(QThread):
                         self.log("[OK]", fu, f"PDF → {len(path)} фото")
                     else:
                         status_code = "404" if err and ("404" in err or "Status 404" in err) else "ERROR"
-                        self.download_errors.append({
-                            "url": fu, "status": status_code, "message": err, "folder": folder_name
-                        })
-                        cell.fill = PatternFill(start_color="FF6347", fill_type="solid")
-                        self.log("[ОШИБКА]", fu, err)
-                        self.stats["fail"] += 1
+                        # Если была отмена — не логируем как ошибку
+                        if not self.check_cancel():
+                            self.download_errors.append({
+                                "url": fu, "status": status_code, "message": err, "folder": folder_name
+                            })
+                            try:
+                                cell.fill = PatternFill(start_color="FF6347", fill_type="solid")
+                            except Exception:
+                                pass
+                            self.log("[ОШИБКА]", fu, err)
+                            self.stats["fail"] += 1
                 except Exception as e:
-                    self.download_errors.append({
-                        "url": val, "status": "ERROR", "message": str(e), "folder": folder_name
-                    })
-                    self.log("[ОШИБКА]", val, str(e))
-                    self.stats["fail"] += 1
+                    if not self.check_cancel():
+                        self.download_errors.append({
+                            "url": val, "status": "ERROR", "message": str(e), "folder": folder_name
+                        })
+                        self.log("[ОШИБКА]", val, str(e))
+                        self.stats["fail"] += 1
                 proc += 1
+                self._dl_done = proc
+
+                # Progress: 5% (submit) + 65% (download) = максимум 70%
+                # Показываем плавно даже если dl_submitted == 0
+                if self._dl_submitted > 0:
+                    dl_pct = 5 + min(65, int(proc * 65 / self._dl_submitted))
+                else:
+                    dl_pct = DL_PROGRESS_MAX
+                if dl_pct != self._last_progress:
+                    self.progress.emit(dl_pct)
+                    self._last_progress = dl_pct
+
+                # Heartbeat: каждые ~500 мс лог "в процессе: N из M"
+                now = time.time()
+                if (now - self._last_log_time) > 0.5:
+                    self.log("[ИНФО]", "Загрузка",
+                             f"Скачано {proc}/{self._dl_submitted}")
+                    self._last_log_time = now
+                    QApplication.processEvents()
+
                 self.emit_stats()
-                self.progress.emit(int(proc / tu * 50))
+                QApplication.processEvents()
+        finally:
+            # Закрываем executor в finally — чтобы cancel() или exception не оставил висящие потоки
+            try:
+                if not self._c:
+                    self.executor.shutdown(wait=True)
+                # Если была отмена — cancel() уже вызвал shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            self.executor = None
 
         self.log("[ИНФО]", "Обработка", "Начинаю обработку...")
         thr = self.s.white_threshold
@@ -1187,13 +2049,13 @@ class Worker(QThread):
                 self.stats["ok"] += 1
                 self.log("[OK]", fname, "PDF скопирован")
                 self.emit_stats()
-                self.progress.emit(50 + int((i + 1) / len(ftp) * 50))
+                self.progress.emit(70 + int((i + 1) / len(ftp) * 30))
                 continue
             if os.path.exists(fp):
                 cell.fill = PatternFill(start_color="90EE90", fill_type="solid")
                 self.stats["ok"] += 1
                 self.emit_stats()
-                self.progress.emit(50 + int((i + 1) / len(ftp) * 50))
+                self.progress.emit(70 + int((i + 1) / len(ftp) * 30))
                 continue
             try:
                 with PILImage.open(rp) as img:
@@ -1218,7 +2080,7 @@ class Worker(QThread):
                 self.stats["fail"] += 1
                 self.log("[ОШИБКА]", rp, str(e))
             self.emit_stats()
-            self.progress.emit(50 + int((i + 1) / len(ftp) * 50))
+            self.progress.emit(70 + int((i + 1) / len(ftp) * 30))
         try:
             if self.s.report_copy:
                 wb.save(os.path.join(os.path.dirname(self.s.source), f"Отчет_{os.path.basename(self.s.source)}"))
@@ -1293,49 +2155,54 @@ def create_valera_pixmap(size: int = Defaults.THUMBNAIL_SIZE):
 class ThumbnailWidget(QFrame):
     selection_changed = Signal()
 
+    # Размер увеличен на 30% (был 110x140 / 90x90)
+    THUMB_W = 143
+    THUMB_H = 160
+    IMG_W = 117
+    IMG_H = 117
+
     def __init__(self, filepath: str, category: str, parent=None):
         super().__init__(parent)
         self.filepath = filepath
         self.category = category
-        self.setFixedSize(110, 140)
+        self.setFixedSize(self.THUMB_W, self.THUMB_H)
         self.setFrameStyle(QFrame.StyledPanel)
         self._update_style(False)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(2)
-        self.checkbox = QCheckBox()
-        self.checkbox.setStyleSheet("QCheckBox::indicator { width: 20px; height: 20px; }")
-        self.checkbox.stateChanged.connect(lambda: self._update_style(self.checkbox.isChecked()))
-        self.checkbox.stateChanged.connect(self.selection_changed)
-        cat_text = ""
-        if category == "QUESTION_WHITE":
-            cat_text = "❓ Белый"
-        elif category == "SIZE_FAIL":
-            cat_text = "📏 Размер"
-        elif category == "ERROR":
-            cat_text = "❌ Ошибка"
-        elif category == "OK_WHITE":
-            cat_text = "✅ Белый"
-        top = QHBoxLayout()
-        top.addWidget(self.checkbox)
-        if cat_text:
-            top.addWidget(QLabel(cat_text))
-            top.addStretch()
-        layout.addLayout(top)
+
+        # ── Картинка ──
         self.img_label = QLabel()
-        self.img_label.setFixedSize(90, 90)
+        self.img_label.setFixedSize(self.IMG_W, self.IMG_H)
         self.img_label.setAlignment(Qt.AlignCenter)
         self.img_label.setStyleSheet("background: #eee; border: 1px solid #ccc;")
         self._load_thumbnail()
         layout.addWidget(self.img_label, alignment=Qt.AlignCenter)
+
+        # ── Нижний ряд: [✓] + имя файла ──
+        bottom = QHBoxLayout()
+        bottom.setSpacing(2)
+
+        self.checkbox = QCheckBox()
+        self.checkbox.setStyleSheet("QCheckBox::indicator { width: 22px; height: 22px; }")
+        self.checkbox.stateChanged.connect(lambda: self._update_style(self.checkbox.isChecked()))
+        self.checkbox.stateChanged.connect(self.selection_changed)
+        bottom.addWidget(self.checkbox)
+
         name = os.path.basename(filepath)
-        dn = name[:15] + "…" if len(name) > 15 else name
+        dn = name[:20] + "…" if len(name) > 20 else name
         self.name_label = QLabel(dn)
-        self.name_label.setAlignment(Qt.AlignCenter)
-        self.name_label.setStyleSheet("font-size: 9px;")
+        self.name_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.name_label.setStyleSheet("font-size: 12px;")   # ← было 10 px, +20 %
         self.name_label.setWordWrap(True)
-        self.name_label.setFixedHeight(25)
-        layout.addWidget(self.name_label)
+        self.name_label.setFixedHeight(28)
+        bottom.addWidget(self.name_label, 1)
+
+        layout.addLayout(bottom)
+
+        # Двойной клик по превью → открыть файл
         self.img_label.mouseDoubleClickEvent = lambda e: QDesktopServices.openUrl(QUrl.fromLocalFile(filepath))
         self._setup_tooltip()
 
@@ -1353,12 +2220,12 @@ class ThumbnailWidget(QFrame):
             if self.filepath.lower().endswith(".pdf"):
                 self.img_label.setText("📄 PDF")
                 self.img_label.setStyleSheet(
-                    "background: #e0f0fb; border: 1px solid #4CA3E0; font-weight: bold; font-size: 16px; color: #2C3E50;"
+                    "background: #e0f0fb; border: 1px solid #4CA3E0; font-weight: bold; font-size: 20px; color: #2C3E50;"
                 )
                 return
             pm = QPixmap(self.filepath)
             if not pm.isNull():
-                self.img_label.setPixmap(pm.scaled(80, 80, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                self.img_label.setPixmap(pm.scaled(self.IMG_W, self.IMG_H, Qt.KeepAspectRatio, Qt.SmoothTransformation))
             else:
                 self.img_label.setText("Файл")
         except Exception:
@@ -1378,13 +2245,19 @@ class ThumbnailWidget(QFrame):
 
 
 class DownloadErrorThumbnail(QFrame):
+    # Размер увеличен на 30% (был 110x140 / 90x90)
+    THUMB_W = 143
+    THUMB_H = 182
+    IMG_W = 117
+    IMG_H = 117
+
     def __init__(self, url, status, message, parent=None):
         super().__init__(parent)
         url_str = str(url or "Неизвестный URL")
         status_str = str(status or "ОШИБКА")
         message_str = str(message or "")
         self.url = url_str
-        self.setFixedSize(110, 140)
+        self.setFixedSize(self.THUMB_W, self.THUMB_H)
         self.setFrameStyle(QFrame.StyledPanel)
         self.setStyleSheet("QFrame { border: 2px solid #E74C3C; border-radius: 4px; background: #FDEDEC; }")
         self.setCursor(Qt.PointingHandCursor)
@@ -1393,32 +2266,32 @@ class DownloadErrorThumbnail(QFrame):
         layout.setSpacing(2)
 
         self.img_label = QLabel()
-        self.img_label.setFixedSize(90, 90)
+        self.img_label.setFixedSize(self.IMG_W, self.IMG_H)
         self.img_label.setAlignment(Qt.AlignCenter)
         self.img_label.setStyleSheet("background: #FADBD8; border: 1px solid #E74C3C; border-radius: 3px;")
-        pix = QPixmap(60, 60)
+        pix = QPixmap(75, 75)
         pix.fill(Qt.transparent)
         with QPainter(pix) as p:
             p.setRenderHint(QPainter.Antialiasing)
-            p.setPen(QPen(QColor(231, 76, 60), 6))
-            p.drawLine(12, 12, 48, 48)
-            p.drawLine(48, 12, 12, 48)
+            p.setPen(QPen(QColor(231, 76, 60), 7))
+            p.drawLine(15, 15, 60, 60)
+            p.drawLine(60, 15, 15, 60)
         self.img_label.setPixmap(pix)
         layout.addWidget(self.img_label, alignment=Qt.AlignCenter)
 
         self.status_label = QLabel(f"❌ {status_str}")
         self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setStyleSheet("color: #C0392B; font-size: 9px; font-weight: bold;")
+        self.status_label.setStyleSheet("color: #C0392B; font-size: 10px; font-weight: bold;")
         self.status_label.setWordWrap(True)
-        self.status_label.setFixedHeight(14)
+        self.status_label.setFixedHeight(16)
         layout.addWidget(self.status_label)
 
-        display = url_str if len(url_str) <= 25 else url_str[:25] + "…"
+        display = url_str if len(url_str) <= 32 else url_str[:32] + "…"
         self.url_label = QLabel(display)
         self.url_label.setAlignment(Qt.AlignCenter)
-        self.url_label.setStyleSheet("color: #7F8C8D; font-size: 8px;")
+        self.url_label.setStyleSheet("color: #7F8C8D; font-size: 9px;")
         self.url_label.setWordWrap(True)
-        self.url_label.setFixedHeight(20)
+        self.url_label.setFixedHeight(24)
         layout.addWidget(self.url_label)
 
         self.img_label.mouseDoubleClickEvent = lambda e: QDesktopServices.openUrl(QUrl.fromUserInput(url_str))
@@ -1440,7 +2313,7 @@ class ProductRowWidget(QFrame):
         self.title_lbl = QLabel(f"📦 {fn}")
         layout.addWidget(self.title_lbl)
         self.tl = QHBoxLayout()
-        self.tl.setSpacing(8)
+        self.tl.setSpacing(10)
         self.tl.setAlignment(Qt.AlignLeft)
         layout.addLayout(self.tl)
 
@@ -1456,6 +2329,7 @@ class ProductPreviewDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Предпросмотр результатов")
         self.resize(1100, 750)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint)
         self.folder_path = folder_path
         self.s = settings
         self.product_rows = []
@@ -1475,8 +2349,10 @@ class ProductPreviewDialog(QDialog):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.addWidget(QLabel("📦 Галочки ➔ Действие снизу. Двойной клик ➔ Открыть. Красные квадраты ➔ Ошибки загрузки (двойной клик — открыть URL)."))
+        layout.setContentsMargins(8, 8, 8, 8)   # ← чуть ужали
+        layout.setSpacing(3)                    # ← было ~6, отступы вдвое меньше
+
+        # УБРАНО: верхний лейбл «📦 Галочки ➔ Действие снизу...»
 
         self.sa = QScrollArea()
         self.sa.setWidgetResizable(True)
@@ -1491,7 +2367,9 @@ class ProductPreviewDialog(QDialog):
         self.cl.setStyleSheet("font-weight: bold; font-size: 12px;")
         layout.addWidget(self.cl)
 
+        # ── Пагинация ──
         pl = QHBoxLayout()
+        pl.setSpacing(4)
         self.btn_prev = QPushButton("◀ Назад")
         self.btn_prev.clicked.connect(self._prev_page)
         self.lbl_page = QLabel("1 / 1")
@@ -1507,6 +2385,7 @@ class ProductPreviewDialog(QDialog):
         pl.addStretch()
         layout.addLayout(pl)
 
+        # ── Прогресс операции ──
         self.op_progress_bar = QProgressBar()
         self.op_progress_bar.setFixedHeight(14)
         self.op_progress_bar.setMaximum(100)
@@ -1523,10 +2402,11 @@ class ProductPreviewDialog(QDialog):
         op_progress_layout.addWidget(self.op_progress_label)
         layout.addLayout(op_progress_layout)
 
+        # ── Нижний ряд кнопок ──
         bl = QHBoxLayout()
         bl.setSpacing(6)
-        btn_min_h = 40
-        btn_min_w = 150
+        btn_min_h = 32      # ← было 40, −20 %
+        btn_min_w = 120     # ← было 150, −20 %
 
         b_undo = QPushButton("↩ Отмена (Ctrl+Z)")
         b_undo.setMinimumSize(btn_min_w, btn_min_h)
@@ -2043,6 +2923,8 @@ class MainWindow(QWidget):
         self.chk_cr = QCheckBox("Удалить исходники")
         self.chk_ssl = QCheckBox("SSL")
         self.chk_ssl.setChecked(True)
+        self.chk_agg = QCheckBox("Искать фото в папках и HTML-страницах")
+        self.chk_agg.setChecked(True)
         b1 = QToolButton()
         b1.setText("ℹ")
         b1.setStyleSheet("border:none;color:blue;")
@@ -2055,6 +2937,23 @@ class MainWindow(QWidget):
         b3.setText("ℹ")
         b3.setStyleSheet("border:none;color:blue;")
         b3.clicked.connect(lambda: QMessageBox.information(self, "Справка", "Отключите, если ошибки SSL в корпоративной сети."))
+        b4 = QToolButton()
+        b4.setText("ℹ")
+        b4.setStyleSheet("border:none;color:blue;")
+        b4.clicked.connect(lambda: QMessageBox.information(
+            self, "Умный парсинг ссылок",
+            "Когда включено:\n"
+            "• Если ссылка ведёт на ПАПКУ (Google Drive, Mail.ru, Dropbox) — "
+            "программа откроет её и скачает все найденные файлы.\n"
+            "• Если ссылка ведёт на страницу-обёртку с превью (HTML вместо картинки) — "
+            "попытается извлечь прямую ссылку на файл через og:image, meta-refresh, "
+            "JSON-LD и другие подсказки.\n\n"
+            "Когда выключено:\n"
+            "• Ссылки на папки вызовут ошибку — программа скачает только то, что "
+            "является файлом по прямой ссылке. Ничего лишнего не подтянется.\n"
+            "• Для случаев, когда вы уверены, что все ссылки — прямые ссылки на фотографии, "
+            "и не хотите рисковать."
+        ))
         hr.addWidget(self.chk_rc)
         hr.addWidget(b1)
         hr.addSpacing(10)
@@ -2063,6 +2962,9 @@ class MainWindow(QWidget):
         hr.addSpacing(10)
         hr.addWidget(self.chk_ssl)
         hr.addWidget(b3)
+        hr.addSpacing(10)
+        hr.addWidget(self.chk_agg)
+        hr.addWidget(b4)
         hr.addStretch()
         self.wer = QWidget()
         self.wer.setLayout(hr)
@@ -2467,6 +3369,7 @@ class MainWindow(QWidget):
                 report_copy=self.chk_rc.isChecked(),
                 clean_raw=self.chk_cr.isChecked(),
                 ssl_verify=self.chk_ssl.isChecked(),
+                aggressive_parse=self.chk_agg.isChecked(),
                 preset_name=self.pc.currentText(),
                 pdf_always_square=self.chk_pdf.isChecked(),
                 selected_rejected_files=self._srf,
@@ -2558,13 +3461,13 @@ class MainWindow(QWidget):
         )
         self.btn_rej.setVisible(True)
         if has_issues:
-            self.btn_rej.setText("⚡ Проверить отбракованные")
+            self.btn_rej.setText("👀 Просмотр")
             self.btn_rej.setStyleSheet(
                 "QPushButton{font-weight:bold;font-size:14px;background-color:#FF9800;color:white;border-radius:5px}"
                 "QPushButton:hover{background-color:#F57C00}"
             )
         else:
-            self.btn_rej.setText("📦 Просмотр результатов")
+            self.btn_rej.setText("👀 Просмотр")
             self.btn_rej.setStyleSheet(
                 "QPushButton{font-weight:bold;font-size:14px;background-color:#27AE60;color:white;border-radius:5px}"
                 "QPushButton:hover{background-color:#229954}"
@@ -2641,6 +3544,7 @@ class MainWindow(QWidget):
         s.setValue("rc", self.chk_rc.isChecked())
         s.setValue("clr", self.chk_cr.isChecked())
         s.setValue("ssl", self.chk_ssl.isChecked())
+        s.setValue("agg", self.chk_agg.isChecked())
         s.setValue("pr", self.pc.currentText())
         s.setValue("pdf", self.chk_pdf.isChecked())
         s.setValue("pwb", self.chk_process_white.isChecked())
@@ -2674,6 +3578,7 @@ class MainWindow(QWidget):
         self.chk_rc.setChecked(s.value("rc", False, type=bool))
         self.chk_cr.setChecked(s.value("clr", False, type=bool))
         self.chk_ssl.setChecked(s.value("ssl", True, type=bool))
+        self.chk_agg.setChecked(s.value("agg", True, type=bool))
         self.chk_pdf.setChecked(s.value("pdf", True, type=bool))
         self.chk_process_white.setChecked(s.value("pwb", True, type=bool))
         self._on_white_bg_toggled()
